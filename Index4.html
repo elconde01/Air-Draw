@@ -1,0 +1,307 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Dibujar en el aire — Señor Don Conde</title>
+<style>
+  :root{--bg:#06070a;--panel:#0f1724;--accent:#ff5d7a;--muted:#9aa6b2}
+  html,body{height:100%;margin:0;font-family:Inter,system-ui,Roboto,Arial;color:#e6eef8;background:linear-gradient(180deg,#051019,#07121a);}
+  .app{width:100%;height:100%;display:grid;grid-template-columns:1fr 320px;gap:12px;padding:12px;box-sizing:border-box}
+  .viewer{position:relative;border-radius:10px;overflow:hidden;background:#000;box-shadow:0 8px 30px rgba(2,6,23,0.6)}
+  video{width:100%;height:100%;object-fit:cover;transform:scaleX(-1);display:block}
+  canvas{position:absolute;left:0;top:0;width:100%;height:100%;pointer-events:none;transform:scaleX(-1)}
+  .panel{background:linear-gradient(180deg,rgba(255,255,255,0.02),rgba(255,255,255,0.01));padding:14px;border-radius:10px}
+  h1{margin:0;font-size:16px}
+  .controls{margin-top:10px;display:flex;flex-direction:column;gap:10px}
+  label{font-size:13px;color:var(--muted)}
+  .row{display:flex;gap:8px;align-items:center}
+  input[type="range"]{flex:1}
+  button{background:var(--accent);border:none;color:white;padding:8px 10px;border-radius:8px;cursor:pointer}
+  button.secondary{background:transparent;border:1px solid rgba(255,255,255,0.06)}
+  .note{font-size:12px;color:var(--muted)}
+  .hud{position:absolute;left:8px;top:8px;padding:6px 8px;background:rgba(0,0,0,0.35);border-radius:8px;font-size:13px}
+  @media (max-width:900px){ .app{grid-template-columns:1fr;} .panel{position:relative;z-index:30} }
+</style>
+
+<!-- MediaPipe Hands -->
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js"></script>
+</head>
+<body>
+<div class="app">
+  <div class="viewer">
+    <video id="video" autoplay playsinline></video>
+    <canvas id="draw"></canvas>    <!-- canvas para dibujos (persistente) -->
+    <canvas id="overlay"></canvas> <!-- canvas para trazo en vivo y debug -->
+    <div id="hud" class="hud">Cargando modelo...</div>
+  </div>
+
+  <div class="panel">
+    <h1>Dibujar en el aire — Señor Don Conde</h1>
+    <div class="controls">
+      <div class="row"><label>Color</label><input id="color" type="color" value="#ff4d6d" style="margin-left:8px" /></div>
+      <div class="row"><label>Grosor</label><input id="size" type="range" min="1" max="40" value="6" /><div id="sizeVal" style="width:34px;text-align:right">6</div></div>
+      <div class="row">
+        <button id="clear">Limpiar</button>
+        <button id="save" class="secondary">Guardar imagen</button>
+        <button id="toggleDebug" class="secondary">Mostrar landmarks</button>
+      </div>
+      <div class="note">Modo dibujo: índice extendido + medio plegado = pintar. Suelte índice para levantar \"lápiz\".</div>
+      <div class="note">Atajo: tecla <strong>Espacio</strong> borra último trazo.</div>
+      <div class="note" style="margin-top:6px">Recomendado: Chrome/Edge. Si va en móvil, abra mediante HTTPS o localhost.</div>
+    </div>
+  </div>
+</div>
+
+<script>
+/* ===================== Config y UI ===================== */
+const videoEl = document.getElementById('video');
+const canvasDraw = document.getElementById('draw');      // donde se guardan los trazos (no se limpia mientras se pinta)
+const canvasOverlay = document.getElementById('overlay'); // overlay para dibujo en vivo + landmarks
+const ctxDraw = canvasDraw.getContext('2d');
+const ctxOverlay = canvasOverlay.getContext('2d');
+
+const hud = document.getElementById('hud');
+const colorInput = document.getElementById('color');
+const sizeInput = document.getElementById('size');
+const sizeVal = document.getElementById('sizeVal');
+const clearBtn = document.getElementById('clear');
+const saveBtn = document.getElementById('save');
+const toggleDebugBtn = document.getElementById('toggleDebug');
+
+let drawing = false;
+let currentStroke = null;
+let strokes = []; // {color,size,points: [{x,y}]}
+let showDebug = false;
+
+/* Ajusta tamaño de canvases a tamaño del video visible (mantiene proporción) */
+function resizeCanvases(){
+  const rect = videoEl.getBoundingClientRect();
+  [canvasDraw, canvasOverlay].forEach(c => {
+    c.width = rect.width;
+    c.height = rect.height;
+    c.style.width = rect.width + 'px';
+    c.style.height = rect.height + 'px';
+  });
+  // redraw persisted strokes (escala interna guardada en px)
+  redrawAll();
+}
+window.addEventListener('resize', ()=>{ if(videoEl.readyState>=2) resizeCanvases(); });
+
+sizeInput.addEventListener('input', ()=> sizeVal.textContent = sizeInput.value);
+clearBtn.addEventListener('click', ()=>{ strokes=[]; ctxDraw.clearRect(0,0,canvasDraw.width,canvasDraw.height); });
+toggleDebugBtn.addEventListener('click', ()=>{ showDebug = !showDebug; toggleDebugBtn.textContent = showDebug ? 'Ocultar landmarks':'Mostrar landmarks'; });
+
+saveBtn.addEventListener('click', ()=>{
+  // Combina video + draw canvas into a single image (flip to correct orientation)
+  const out = document.createElement('canvas');
+  out.width = canvasDraw.width; out.height = canvasDraw.height;
+  const octx = out.getContext('2d');
+  // video is mirrored by CSS transform, but pixel drawing is not mirrored; draw mirrored video:
+  octx.save(); octx.scale(-1,1); octx.drawImage(videoEl, -out.width, 0, out.width, out.height); octx.restore();
+  octx.drawImage(canvasDraw, 0, 0);
+  out.toBlob(blob=>{
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a'); a.href = url; a.download = 'dibujo_aire.png'; a.click();
+    URL.revokeObjectURL(url);
+  }, 'image/png');
+});
+
+/* ===================== Helpers ===================== */
+/* suavizado simple (moving average) para un array de puntos */
+function smoothPoints(points, windowSize=3){
+  if(points.length <= windowSize) return points;
+  const out = [];
+  for(let i=0;i<points.length;i++){
+    let sx=0, sy=0, count=0;
+    for(let j=Math.max(0,i-windowSize+1); j<=i; j++){ sx+=points[j].x; sy+=points[j].y; count++; }
+    out.push({x: sx/count, y: sy/count});
+  }
+  return out;
+}
+
+/* redibuja todos los strokes guardados en canvasDraw */
+function redrawAll(){
+  ctxDraw.clearRect(0,0,canvasDraw.width,canvasDraw.height);
+  for(const s of strokes){
+    if(!s.points || s.points.length===0) continue;
+    ctxDraw.lineJoin = 'round';
+    ctxDraw.lineCap = 'round';
+    ctxDraw.strokeStyle = s.color;
+    ctxDraw.lineWidth = s.size;
+    ctxDraw.beginPath();
+    ctxDraw.moveTo(s.points[0].x, s.points[0].y);
+    for(let i=1;i<s.points.length;i++) ctxDraw.lineTo(s.points[i].x, s.points[i].y);
+    ctxDraw.stroke();
+  }
+}
+
+/* dibuja landmarks en overlay (para debug) */
+function drawLandmarks(context, landmarks){
+  context.save();
+  context.fillStyle = 'rgba(0,255,180,0.9)';
+  context.strokeStyle = 'rgba(0,255,180,0.8)';
+  for(const p of landmarks){
+    context.beginPath(); context.arc(p.x, p.y, 6, 0, Math.PI*2); context.fill();
+  }
+  // opcional: dibujar conexiones usando MP drawing utils no necesario
+  context.restore();
+}
+
+/* ===================== MediaPipe Hands ===================== */
+const hands = new Hands({
+  locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`
+});
+hands.setOptions({
+  maxNumHands: 1,
+  modelComplexity: 1,
+  minDetectionConfidence: 0.7,
+  minTrackingConfidence: 0.6
+});
+
+/* Lógica para determinar dedo extendido:
+   compara y (eje vertical normalizado) del tip vs pip
+   (en el sistema de MediaPipe, y más pequeño = más arriba en imagen)
+*/
+function isExtended(landmarks, tipIdx, pipIdx, margin=0.02){
+  return landmarks[tipIdx].y < landmarks[pipIdx].y - margin;
+}
+
+/* Convertir landmark normalizado (0..1) a coordenadas de canvas (px)
+   Tomamos el bounding box del video en viewport (videoEl.getBoundingClientRect()).
+   IMPORTANTE: tanto video como canvas están mirrored por CSS; los landmarks vienen sin mirror,
+   por eso invertimos x: x_px = (1 - lm.x) * width
+*/
+function lmToPx(lm, canvasW, canvasH){
+  return { x: (1 - lm.x) * canvasW, y: lm.y * canvasH };
+}
+
+/* Manejo del resultado (se ejecuta muchas veces) */
+let lastAddTime = 0;
+const ADD_INTERVAL_MS = 10; // throttle para no acumular puntos cada ms
+
+hands.onResults(results => {
+  const lm = results.multiHandLandmarks && results.multiHandLandmarks[0];
+  const cW = canvasDraw.width, cH = canvasDraw.height;
+
+  // limpiar overlay cada frame (overlay sirve para trazo activo y debug)
+  ctxOverlay.clearRect(0,0,cW,cH);
+
+  if(lm){
+    // índices de landmarks: 8=index_tip,6=index_pip,12=middle_tip,10=middle_pip
+    const idxExtended = isExtended(lm,8,6);
+    const midExtended = isExtended(lm,12,10);
+    const shouldDraw = idxExtended && !midExtended;
+
+    hud.textContent = shouldDraw ? 'Dibujando — índice arriba, medio abajo' : 'No dibujando — levante índice y pliegue medio para pintar';
+
+    // punto en px
+    const pt = lmToPx(lm[8], cW, cH);
+
+    // dibujar un marcador del punto en overlay (suave, para feedback)
+    ctxOverlay.beginPath();
+    ctxOverlay.fillStyle = 'rgba(255,90,120,0.95)';
+    ctxOverlay.arc(pt.x, pt.y, Math.max(4, sizeInput.value/2), 0, Math.PI*2);
+    ctxOverlay.fill();
+
+    // debug landmarks
+    if(showDebug) drawLandmarks(ctxOverlay, lm.map(p => lmToPx(p, cW, cH)));
+
+    if(shouldDraw){
+      if(!drawing){
+        // iniciar stroke
+        drawing = true;
+        currentStroke = { color: colorInput.value, size: parseInt(sizeInput.value,10), points: [] };
+        strokes.push(currentStroke);
+      }
+      // throttle agregar puntos (evita exceso)
+      const now = performance.now();
+      if(now - lastAddTime > ADD_INTERVAL_MS){
+        currentStroke.points.push(pt);
+        lastAddTime = now;
+      }
+
+      // dibujar en overlay el segmento más reciente para feedback inmediato
+      const pts = currentStroke.points;
+      if(pts.length >= 2){
+        ctxOverlay.lineJoin = 'round';
+        ctxOverlay.lineCap = 'round';
+        ctxOverlay.strokeStyle = currentStroke.color;
+        ctxOverlay.lineWidth = currentStroke.size;
+        ctxOverlay.beginPath();
+        ctxOverlay.moveTo(pts[pts.length-2].x, pts[pts.length-2].y);
+        ctxOverlay.lineTo(pts[pts.length-1].x, pts[pts.length-1].y);
+        ctxOverlay.stroke();
+      }
+    } else {
+      // si dejamos de dibujar — finalize stroke: suavizar y pintar en canvasDraw acumulado
+      if(drawing && currentStroke){
+        // suavizar puntos y pintar definitivamente en canvasDraw
+        const smooth = smoothPoints(currentStroke.points, 3);
+        currentStroke.points = smooth;
+        // dibujar en draw canvas (persistente)
+        ctxDraw.lineJoin = 'round';
+        ctxDraw.lineCap = 'round';
+        ctxDraw.strokeStyle = currentStroke.color;
+        ctxDraw.lineWidth = currentStroke.size;
+        ctxDraw.beginPath();
+        if(smooth.length>0) ctxDraw.moveTo(smooth[0].x, smooth[0].y);
+        for(let i=1;i<smooth.length;i++) ctxDraw.lineTo(smooth[i].x, smooth[i].y);
+        ctxDraw.stroke();
+      }
+      drawing = false;
+      currentStroke = null;
+    }
+  } else {
+    hud.textContent = 'Mano no detectada — acérquela al centro del cuadro';
+    // si la mano desaparece mientras dibujamos, finalizamos (igual que above)
+    if(drawing && currentStroke){
+      const smooth = smoothPoints(currentStroke.points, 3);
+      currentStroke.points = smooth;
+      ctxDraw.lineJoin = 'round';
+      ctxDraw.lineCap = 'round';
+      ctxDraw.strokeStyle = currentStroke.color;
+      ctxDraw.lineWidth = currentStroke.size;
+      ctxDraw.beginPath();
+      if(smooth.length>0) ctxDraw.moveTo(smooth[0].x, smooth[0].y);
+      for(let i=1;i<smooth.length;i++) ctxDraw.lineTo(smooth[i].x, smooth[i].y);
+      ctxDraw.stroke();
+    }
+    drawing = false;
+    currentStroke = null;
+  }
+});
+
+/* ===================== Cámara ===================== */
+const cameraUtils = new Camera(videoEl, {
+  onFrame: async () => { await hands.send({image: videoEl}); },
+  width: 1280,
+  height: 720
+});
+
+async function start(){
+  try{
+    await cameraUtils.start();
+    hud.textContent = 'Modelo cargado. Use mano derecha frente a la cámara.';
+    // espera que el video tenga tamaño para ajustar canvases
+    setTimeout(()=>{ resizeCanvases(); }, 250);
+  } catch(err){
+    hud.textContent = 'Error al iniciar cámara: ' + (err.message || err);
+    console.error('camera start error', err);
+  }
+}
+start();
+
+/* ===================== Atajos teclado y limpieza ===================== */
+window.addEventListener('keydown', e=>{
+  if(e.code === 'Space'){ strokes.pop(); ctxDraw.clearRect(0,0,canvasDraw.width,canvasDraw.height); redrawAll(); e.preventDefault(); }
+});
+
+/* En caso de que el usuario redimensione la ventana después de iniciar video, reescalar */
+videoEl.addEventListener('loadeddata', ()=>{ resizeCanvases(); });
+
+</script>
+</body>
+</html>
