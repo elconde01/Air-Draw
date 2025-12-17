@@ -175,9 +175,9 @@ function isExtended(landmarks, tipIdx, pipIdx, margin=0.02){
    por eso invertimos x: x_px = (1 - lm.x) * width
 */
 function lmToPx(lm, canvasW, canvasH){
-  return { x: (lm.x) * canvasW, y: lm.y * canvasH };
+  return { x: lm.x * canvasW, y: lm.y * canvasH };
 }
-
+  
 /* Manejo del resultado (se ejecuta muchas veces) */
 let lastAddTime = 0;
 const ADD_INTERVAL_MS = 10; // throttle para no acumular puntos cada ms
